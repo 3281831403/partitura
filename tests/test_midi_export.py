@@ -6,7 +6,7 @@ This module cotains tests for exporting MIDI file methods.
 import logging
 from collections import defaultdict, Counter, OrderedDict
 import unittest
-from tempfile import TemporaryFile
+from tempfile import TemporaryFile, NamedTemporaryFile
 import mido
 import numpy as np
 from tempfile import TemporaryDirectory
@@ -528,3 +528,165 @@ class TestIncompleteMeasures(unittest.TestCase):
         self.assertTrue(cumulative_position==3)
 
 
+
+
+# ---------------------------------------------------------------------------
+# Fixed-MIDI round-trip tests for save_performance_midi
+# ---------------------------------------------------------------------------
+
+PPQ = 480
+
+
+def _tempo_events(mid):
+    """Return all set_tempo events as sorted (absolute_tick, mpq) pairs."""
+    events = []
+    for track in mid.tracks:
+        t = 0
+        for msg in track:
+            t += msg.time
+            if msg.type == "set_tempo":
+                events.append((t, msg.tempo))
+    return sorted(events)
+
+
+def _make_tempo_map_midi():
+    """Tempo map on a dedicated conductor track with two tempo changes."""
+    mid = mido.MidiFile(ticks_per_beat=PPQ)
+    note_track = mido.MidiTrack()
+    conductor_track = mido.MidiTrack()
+    mid.tracks.append(note_track)
+    mid.tracks.append(conductor_track)
+
+    # note 60: beat 0 -> beat 1 (120 bpm -> 0.5 s)
+    note_track.append(mido.Message("note_on", note=60, velocity=64, time=0))
+    note_track.append(mido.Message("note_off", note=60, velocity=0, time=PPQ))
+    # note 62: beat 1 -> beat 2 (60 bpm -> 1.0 s)
+    note_track.append(mido.Message("note_on", note=62, velocity=72, time=0))
+    note_track.append(mido.Message("note_off", note=62, velocity=0, time=PPQ))
+
+    conductor_track.append(
+        mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(120), time=0)
+    )
+    conductor_track.append(
+        mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(60), time=PPQ)
+    )
+    return mid
+
+
+def _make_retrigger_midi():
+    mid = mido.MidiFile(ticks_per_beat=PPQ)
+    track = mido.MidiTrack()
+    mid.tracks.append(track)
+    track.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(120), time=0))
+    track.append(mido.Message("note_on", note=60, velocity=64, time=0))
+    track.append(mido.Message("note_on", note=60, velocity=80, time=240))
+    track.append(mido.Message("note_off", note=60, velocity=0, time=240))
+    return mid
+
+
+def _note_tuples(perf):
+    return sorted(
+        (
+            n["midi_pitch"],
+            round(n["note_on"], 6),
+            round(n["note_off"], 6),
+            n["note_on_tick"],
+            n["note_off_tick"],
+            n["velocity"],
+        )
+        for ppart in perf.performedparts
+        for n in ppart.notes
+    )
+
+
+def _save_temp_midi(mid):
+    """Save an in-memory MidiFile to a temporary path and return the path."""
+    f = NamedTemporaryFile(suffix=".mid", delete=False)
+    mid.save(f.name)
+    f.close()
+    return f.name
+
+
+class TestPerformanceMIDIRoundTrip(unittest.TestCase):
+    def test_tempo_events_round_trip(self):
+        """save_performance_midi preserves the full tempo event list."""
+        path = _save_temp_midi(_make_tempo_map_midi())
+        try:
+            perf = load_performance_midi(path)
+            save_performance_midi(perf, path)
+            rt_mid = mido.MidiFile(path)
+        finally:
+            os.unlink(path)
+
+        expected_tempos = _tempo_events(_make_tempo_map_midi())
+        self.assertEqual(_tempo_events(rt_mid), expected_tempos)
+        # tempo messages are written to the first track only
+        first_track_tempos = [m for m in rt_mid.tracks[0] if m.type == "set_tempo"]
+        self.assertEqual(len(first_track_tempos), len(expected_tempos))
+
+    def test_note_times_round_trip_seconds_and_ticks(self):
+        """Note pitches, seconds and ticks survive a load/save/load cycle."""
+        path = _save_temp_midi(_make_tempo_map_midi())
+        try:
+            perf = load_performance_midi(path)
+            save_performance_midi(perf, path)
+            rt_perf = load_performance_midi(path)
+        finally:
+            os.unlink(path)
+
+        self.assertEqual(_note_tuples(perf), _note_tuples(rt_perf))
+        notes = {n["midi_pitch"]: n for n in rt_perf.performedparts[0].notes}
+        # exact seconds under the changing tempo
+        self.assertAlmostEqual(notes[60]["note_on"], 0.0, places=6)
+        self.assertAlmostEqual(notes[60]["note_off"], 0.5, places=6)
+        self.assertAlmostEqual(notes[62]["note_on"], 0.5, places=6)
+        self.assertAlmostEqual(notes[62]["note_off"], 1.5, places=6)
+        # exact ticks
+        self.assertEqual(notes[60]["note_on_tick"], 0)
+        self.assertEqual(notes[60]["note_off_tick"], PPQ)
+        self.assertEqual(notes[62]["note_on_tick"], PPQ)
+        self.assertEqual(notes[62]["note_off_tick"], 2 * PPQ)
+
+    def test_retrigger_round_trip_event_count(self):
+        """A retriggered pitch keeps both notes through the round-trip."""
+        path = _save_temp_midi(_make_retrigger_midi())
+        try:
+            perf = load_performance_midi(path)
+            save_performance_midi(perf, path)
+            rt_perf = load_performance_midi(path)
+            written = mido.MidiFile(path)
+        finally:
+            os.unlink(path)
+
+        self.assertEqual(_note_tuples(perf), _note_tuples(rt_perf))
+        self.assertEqual(len(rt_perf.performedparts[0].notes), 2)
+        # count raw note_on events in the written file
+        n_note_on = sum(
+            1
+            for track in written.tracks
+            for msg in track
+            if msg.type == "note_on" and msg.velocity > 0
+        )
+        self.assertEqual(n_note_on, 2)
+
+    def test_synthetic_performance_default_tempo(self):
+        """A PerformedPart without tempo map gets the default 120 bpm tempo."""
+        note_array = np.empty(
+            1,
+            dtype=[
+                ("onset_sec", "f4"),
+                ("duration_sec", "f4"),
+                ("pitch", "i4"),
+                ("velocity", "i4"),
+                ("track", "i4"),
+                ("channel", "i4"),
+                ("id", "U256"),
+            ],
+        )
+        note_array[0] = (0.0, 0.5, 60, 64, 0, 0, "n0")
+        ppart = PerformedPart.from_note_array(note_array)
+        self.assertFalse(hasattr(ppart, "tempo_changes"))
+
+        mf = save_performance_midi(ppart, out=None)
+        tempos = _tempo_events(mf)
+        self.assertEqual(tempos, [(0, 500000)])

@@ -38,6 +38,168 @@ def note_hash(channel: int, pitch: int) -> int:
     return channel * 128 + pitch
 
 
+def collect_global_tempo_map(
+    mid: mido.MidiFile,
+    default_mpq: int,
+) -> List[Tuple[int, int]]:
+    """Collect all tempo changes of a MIDI file on a single global timeline.
+
+    In a SMF type 1 file tempo events have a global effect regardless of the
+    track they live in, and delta times of every track are measured against
+    the same tick timeline. Scanning the tracks separately (and, e.g., only
+    looking at the tempo events in the first track) therefore produces wrong
+    second values whenever the tempo map is stored in a dedicated conductor
+    track or is spread across several tracks.
+
+    Parameters
+    ----------
+    mid : mido.MidiFile
+        The MIDI file to scan.
+    default_mpq : int
+        Microseconds per quarter note used before the first tempo event
+        (and whenever the file contains no tempo events).
+
+    Returns
+    -------
+    list of tuple[int, int]
+        A sorted list of ``(tick, mpq)`` pairs, always starting with
+        ``(0, default_mpq)``. Consecutive entries with the same mpq are
+        collapsed, so the list can be fed directly to :func:`adjust_time`.
+    """
+    tempo_events = []
+    for track in mid.tracks:
+        ttick = 0
+        for msg in track:
+            ttick += msg.time
+            if isinstance(msg, mido.MetaMessage) and msg.type == "set_tempo":
+                tempo_events.append((ttick, int(msg.tempo)))
+
+    tempo_events.sort(key=itemgetter(0))
+
+    tempo_changes = [(0, default_mpq)]
+    for tick, mpq in tempo_events:
+        if tick == 0:
+            # an explicit tempo at the origin replaces the default
+            tempo_changes = [(0, mpq)]
+        elif tempo_changes[-1][0] == tick:
+            # several tempos at the same tick: the last one wins
+            tempo_changes[-1] = (tick, mpq)
+        elif tempo_changes[-1][1] != mpq:
+            # only record a new entry when the tempo actually changes
+            tempo_changes.append((tick, mpq))
+    return tempo_changes
+
+
+def pair_note_events(
+    track: mido.MidiTrack,
+) -> Tuple[List[dict], int]:
+    """Pair MIDI note on/off events of a single track into notes.
+
+    This is the single pairing logic shared by
+    :func:`load_performance_midi` and :func:`load_score_midi`. It handles
+    two situations that a naive on/off stack does not:
+
+    * Retriggered notes: when a ``note_on`` (velocity > 0) arrives while the
+      same ``(channel, pitch)`` is still sounding, the previously sounding
+      note is closed at the tick of the new ``note_on``, and the new note
+      starts there. This preserves fast repetitions of the same pitch
+      instead of silently dropping the first note.
+    * Hanging notes: a ``note_on`` without a matching ``note_off`` is closed
+      at the tick of the last event in the track (including the
+      ``end_of_track`` meta message position), so a truncated recording no
+      longer loses the whole track.
+
+    A ``note_on`` with velocity 0 is treated as a ``note_off``, as required
+    by the MIDI specification. ``note_off`` events without a matching
+    ``note_on`` are ignored with a warning.
+
+    Parameters
+    ----------
+    track : mido.MidiTrack
+        The MIDI track whose messages are scanned. Delta times are converted
+        to absolute ticks.
+
+    Returns
+    -------
+    notes : list of dict
+        The paired notes in the order in which they were closed. Each dict
+        has the keys ``channel``, ``midi_pitch``, ``velocity``,
+        ``note_on_tick`` and ``note_off_tick``. Notes produced by
+        retriggering carry the velocity of their own ``note_on``.
+    last_tick : int
+        Absolute tick position of the last event in the track.
+    """
+    notes = []
+    sounding_notes = {}
+    ttick = 0
+    last_tick = 0
+
+    for msg in track:
+        ttick += msg.time
+        last_tick = ttick
+
+        note_on = msg.type == "note_on"
+        note_off = msg.type == "note_off"
+
+        if not (note_on or note_off):
+            continue
+
+        # hash sounding note
+        note = note_hash(msg.channel, msg.note)
+
+        # start note if it's a 'note on' event with velocity > 0
+        if note_on and msg.velocity > 0:
+            if note in sounding_notes:
+                # retrigger: close the previously sounding note at the
+                # tick of the new note_on instead of dropping it
+                onset_tick, velocity = sounding_notes[note]
+                notes.append(
+                    dict(
+                        midi_pitch=msg.note,
+                        note_on_tick=onset_tick,
+                        note_off_tick=ttick,
+                        channel=msg.channel,
+                        velocity=velocity,
+                    )
+                )
+            # save the onset time and velocity of the new note
+            sounding_notes[note] = (ttick, msg.velocity)
+
+        # end note if it's a 'note off' event or 'note on' with velocity 0
+        elif note_off or (note_on and msg.velocity == 0):
+            if note not in sounding_notes:
+                warnings.warn(f"ignoring MIDI message {msg}")
+                continue
+
+            onset_tick, velocity = sounding_notes[note]
+            notes.append(
+                dict(
+                    midi_pitch=msg.note,
+                    note_on_tick=onset_tick,
+                    note_off_tick=ttick,
+                    channel=msg.channel,
+                    velocity=velocity,
+                )
+            )
+            del sounding_notes[note]
+
+    # close any notes that are still sounding at the last event of the
+    # track (hanging notes, e.g. a recording cut before the note_off)
+    for note, (onset_tick, velocity) in sounding_notes.items():
+        channel, pitch = divmod(note, 128)
+        notes.append(
+            dict(
+                midi_pitch=pitch,
+                note_on_tick=onset_tick,
+                note_off_tick=last_tick,
+                channel=channel,
+                velocity=velocity,
+            )
+        )
+
+    return notes, last_tick
+
+
 @deprecated_alias(fn="filename")
 def midi_to_notearray(filename: PathLike) -> np.ndarray:
     """Load a MIDI file in a note_array.
@@ -119,11 +281,11 @@ def load_performance_midi(
         ppq = mid.ticks_per_beat
         # microseconds per quarter
         default_mpq = int(60 * (10**6 / default_bpm))
-        # Initialize time conversion factor
-        time_conversion_factor = default_mpq / (ppq * 10**6)
 
-        # Initialize list of tempos
-        tempo_changes = [(0, default_mpq)]
+        # Tempo events have a global effect in MIDI and may live in any
+        # track, so build a single sorted global tempo map before scanning
+        # individual tracks.
+        tempo_changes = collect_global_tempo_map(mid, default_mpq)
 
         pps = list()
 
@@ -134,7 +296,6 @@ def load_performance_midi(
             tracks = [(i, u) for i, u in enumerate(mid.tracks)]
 
         for i, track in tracks:
-            notes = []
             controls = []
             programs = []
             # This information is just for completeness,
@@ -147,28 +308,36 @@ def load_performance_midi(
             # other MetaMessages (not including key and time_signature)
             meta_other = []
 
-            t = 0
             ttick = 0
 
-            sounding_notes = {}
+            # Pair note_on/note_off events with the shared logic
+            # (handles retriggered and hanging notes)
+            paired_notes, _ = pair_note_events(track)
+            notes = [
+                dict(
+                    midi_pitch=pn["midi_pitch"],
+                    note_on_tick=pn["note_on_tick"],
+                    note_off_tick=pn["note_off_tick"],
+                    track=i,
+                    channel=pn["channel"],
+                    velocity=pn["velocity"],
+                )
+                for pn in paired_notes
+            ]
 
             for msg in track:
-                # Update time deltas
-                t += msg.time * time_conversion_factor
+                # Update tick position (seconds are derived afterwards from
+                # the global tempo map)
                 ttick += msg.time
 
                 if isinstance(msg, mido.MetaMessage):
                     if msg.type == "set_tempo":
-                        mpq = msg.tempo
-                        if (
-                            tempo_changes[-1][1] != mpq
-                        ):  # only add new tempo if it's different from the last one
-                            tempo_changes.append((ttick, mpq))
-                        time_conversion_factor = mpq / (ppq * 10**6)
+                        # the global tempo map already accounts for all
+                        # tempo events in all tracks
+                        continue
                     elif msg.type == "time_signature":
                         time_signatures.append(
                             dict(
-                                time=t,
                                 time_tick=ttick,
                                 beats=int(msg.numerator),
                                 beat_type=int(msg.denominator),
@@ -180,7 +349,6 @@ def load_performance_midi(
                         fifths, mode = key_name_to_fifths_mode(key_name)
                         key_signatures.append(
                             dict(
-                                time=t,
                                 time_tick=ttick,
                                 key_name=str(msg.key),
                                 fifths=fifths,
@@ -195,7 +363,6 @@ def load_performance_midi(
                         # https://mido.readthedocs.io/en/latest/meta_message_types.html
                         msg_dict = dict(
                             [
-                                ("time", t),
                                 ("time_tick", ttick),
                                 ("track", i),
                             ]
@@ -211,7 +378,6 @@ def load_performance_midi(
                 elif msg.type == "control_change":
                     controls.append(
                         dict(
-                            time=t,
                             time_tick=ttick,
                             number=msg.control,
                             value=msg.value,
@@ -223,7 +389,6 @@ def load_performance_midi(
                 elif msg.type == "program_change":
                     programs.append(
                         dict(
-                            time=t,
                             time_tick=ttick,
                             program=msg.program,
                             track=i,
@@ -231,58 +396,19 @@ def load_performance_midi(
                         )
                     )
 
-                else:
-                    note_on = msg.type == "note_on"
-                    note_off = msg.type == "note_off"
-
-                    if not (note_on or note_off):
-                        continue
-
-                    # hash sounding note
-                    note = note_hash(msg.channel, msg.note)
-
-                    # start note if it's a 'note on' event with velocity > 0
-                    if note_on and msg.velocity > 0:
-                        # save the onset time and velocity
-                        sounding_notes[note] = (t, ttick, msg.velocity)
-
-                    # end note if it's a 'note off' event or 'note on' with velocity 0
-                    elif note_off or (note_on and msg.velocity == 0):
-                        if note not in sounding_notes:
-                            warnings.warn(f"ignoring MIDI message {msg}")
-                            continue
-
-                        # append the note to the list associated with the channel
-                        notes.append(
-                            dict(
-                                # id=f"n{len(notes)}",
-                                midi_pitch=msg.note,
-                                note_on=(sounding_notes[note][0]),
-                                note_on_tick=(sounding_notes[note][1]),
-                                note_off=(t),
-                                note_off_tick=(ttick),
-                                track=i,
-                                channel=msg.channel,
-                                velocity=sounding_notes[note][2],
-                            )
-                        )
-
-                        # remove hash from dict
-                        del sounding_notes[note]
-
             # fix note ids so that it is sorted lexicographically
             # by onset, pitch, offset, channel and track
             notes.sort(
                 key=lambda x: (
-                    x["note_on"],
+                    x["note_on_tick"],
                     x["midi_pitch"],
-                    x["note_off"],
+                    x["note_off_tick"],
                     x["channel"],
                     x["track"],
                 )
             )
 
-            # adjust timing of events based on tempo changes
+            # adjust timing of events based on the global tempo changes
             for note in notes:
                 note["note_on"] = adjust_time(note["note_on_tick"], tempo_changes, ppq)
                 note["note_off"] = adjust_time(
@@ -319,6 +445,9 @@ def load_performance_midi(
                     mpq=default_mpq,
                     track=i,
                 )
+                # retain the full tempo map so that e.g. save_performance_midi
+                # can round-trip the tempo events
+                pp.tempo_changes = list(tempo_changes)
                 pps.append(pp)
 
         perf = performance.Performance(
@@ -488,11 +617,7 @@ or a list of these
         for track_nr, track in enumerate(mid.tracks):
             time_sigs = []
             key_sigs = []
-            # tempos = []
             notes = defaultdict(list)
-            # dictionary for storing the last onset time and velocity for each
-            # individual note (i.e. same pitch and channel)
-            sounding_notes = {}
             # current time (will be updated by delta times in messages)
             t_raw = 0
 
@@ -513,38 +638,19 @@ or a list of these
                     key_sigs.append((t, msg.key))
                 if msg.type == "set_tempo":
                     global_tempos.append((t, 60 * 10**6 / msg.tempo))
+
+            # pair note_on/note_off events with the same logic as
+            # load_performance_midi (retriggered notes closed at the second
+            # note_on, hanging notes closed at the last track event)
+            paired_notes, _ = pair_note_events(track)
+            for pn in paired_notes:
+                if quantization_unit:
+                    onset = quantize(pn["note_on_tick"], quantization_unit)
+                    offset = quantize(pn["note_off_tick"], quantization_unit)
                 else:
-                    note_on = msg.type == "note_on"
-                    note_off = msg.type == "note_off"
-
-                    if not (note_on or note_off):
-                        continue
-
-                    # hash sounding note
-                    note = note_hash(msg.channel, msg.note)
-
-                    # start note if it's a 'note on' event with velocity > 0
-                    if note_on and msg.velocity > 0:
-                        # save the onset time and velocity
-                        sounding_notes[note] = (t, msg.velocity)
-
-                    # end note if it's a 'note off' event or 'note on' with velocity 0
-                    elif note_off or (note_on and msg.velocity == 0):
-                        if note not in sounding_notes:
-                            warnings.warn("ignoring MIDI message %s" % msg)
-                            continue
-
-                        # append the note to the list associated with the channel
-                        notes[msg.channel].append(
-                            (
-                                sounding_notes[note][0],
-                                msg.note,
-                                t - sounding_notes[note][0],
-                            )
-                        )
-                        # sounding_notes[note][1]])
-                        # remove hash from dict
-                        del sounding_notes[note]
+                    onset = pn["note_on_tick"]
+                    offset = pn["note_off_tick"]
+                notes[pn["channel"]].append((onset, pn["midi_pitch"], offset - onset))
 
             # if a track has no notes, we assume it may contain global time/key sigs
             if not notes:
@@ -561,6 +667,17 @@ or a list of these
                 # sig / tempo information under the key (track_nr, ch_nr)
                 if len(ch_notes) > 0:
                     notes_by_track_ch[(track_nr, ch)] = ch_notes
+
+        # Tempo events have a global effect in MIDI and may be located in any
+        # track (typically a dedicated conductor track), so sort them along the
+        # global tick timeline before attaching them to the score.
+        global_tempos.sort(key=itemgetter(0))
+
+        if not notes_by_track_ch:
+            raise ValueError(
+                "MIDI file does not contain any notes: cannot create a score "
+                f"from {getattr(mid, 'filename', None) or filename}"
+            )
 
         tr_ch_keys = sorted(notes_by_track_ch.keys())
         group_part_voice_keys, part_names, group_names = assign_group_part_voice(

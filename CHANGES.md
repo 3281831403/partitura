@@ -1,5 +1,14 @@
 # Release Notes
 
+## Unreleased
+
+### Bug Fixes
+
+* `load_performance_midi` and `load_score_midi` now share a single MIDI note on/off pairing logic: a retriggered note (a second `note_on` on the same channel and pitch before the `note_off`) closes the previous note at the second `note_on` instead of dropping it, and hanging notes (a `note_on` without a matching `note_off`) are truncated to the last event of the track instead of producing an empty track.
+* `load_score_midi` raises a `ValueError` instead of an `IndexError` when the MIDI file contains no notes.
+* Tempo events are now collected from all tracks onto a single sorted global timeline, so seconds in `note_array` and performed-part note times are correct when the tempo map is stored outside the first track.
+* `save_performance_midi` round-trips the full tempo event map and preserves note tick times when saving a performance previously loaded from MIDI.
+
 ## Version 1.8.0
 
 This version introduces the following changes. As of this version, the minimum required Python version is Python 3.10. Use Partitura version ≤ 1.7.0 for Python 3.7 to 3.9.

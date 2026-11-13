@@ -6,6 +6,7 @@ This module contains tests for importing MIDI files.
 
 import os
 import logging
+import warnings
 from collections import defaultdict, Counter
 from operator import itemgetter
 import unittest
@@ -512,3 +513,267 @@ class TestLoadPerformanceMIDI(unittest.TestCase):
 
         self.assertEqual(key_signatures[1]['key_name'], 'G')
         self.assertAlmostEqual(key_signatures[1]['time'], 0.5, places=6)  # 120 BPM -> 0.5 seconds
+
+
+# ---------------------------------------------------------------------------
+# Helpers for fixed-MIDI event pairing tests
+# ---------------------------------------------------------------------------
+
+PPQ = 480
+
+
+def _save_temp_midi(mid):
+    """Save an in-memory MidiFile to a temporary path and return the path."""
+    f = NamedTemporaryFile(suffix=".mid", delete=False)
+    mid.save(f.name)
+    f.close()
+    return f.name
+
+
+def _make_retrigger_midi():
+    """Same pitch retriggered before the first note is released."""
+    mid = mido.MidiFile(ticks_per_beat=PPQ)
+    track = mido.MidiTrack()
+    mid.tracks.append(track)
+    track.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(120), time=0))
+    # note on at tick 0, retrigger at tick 240, note off at tick 480
+    track.append(mido.Message("note_on", note=60, velocity=64, time=0))
+    track.append(mido.Message("note_on", note=60, velocity=80, time=240))
+    track.append(mido.Message("note_off", note=60, velocity=0, time=240))
+    return mid
+
+
+def _make_hanging_note_midi():
+    """Note on events without any note off."""
+    mid = mido.MidiFile(ticks_per_beat=PPQ)
+    track = mido.MidiTrack()
+    mid.tracks.append(track)
+    track.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(120), time=0))
+    track.append(mido.Message("note_on", note=64, velocity=70, time=0))
+    track.append(mido.Message("note_on", note=64, velocity=71, time=480))
+    return mid
+
+
+def _make_noteless_midi():
+    """A MIDI file containing only meta events but no notes."""
+    mid = mido.MidiFile(ticks_per_beat=PPQ)
+    track = mido.MidiTrack()
+    mid.tracks.append(track)
+    track.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(120), time=0))
+    track.append(mido.MetaMessage("time_signature", numerator=4, denominator=4, time=0))
+    return mid
+
+
+def _make_tempo_on_second_track_midi():
+    """Tempo map lives on a dedicated conductor track (the second track)."""
+    mid = mido.MidiFile(ticks_per_beat=PPQ)
+    note_track = mido.MidiTrack()
+    conductor_track = mido.MidiTrack()
+    mid.tracks.append(note_track)
+    mid.tracks.append(conductor_track)
+
+    # two consecutive quarter notes
+    note_track.append(mido.Message("note_on", note=60, velocity=64, time=0))
+    note_track.append(mido.Message("note_off", note=60, velocity=0, time=PPQ))
+    note_track.append(mido.Message("note_on", note=62, velocity=64, time=0))
+    note_track.append(mido.Message("note_off", note=62, velocity=0, time=PPQ))
+
+    # 120 bpm for the first beat, 60 bpm afterwards
+    conductor_track.append(
+        mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(120), time=0)
+    )
+    conductor_track.append(
+        mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(60), time=PPQ)
+    )
+    return mid
+
+
+class TestMIDINoteEventPairing(unittest.TestCase):
+    """Fixed-MIDI assertions for the shared on/off event pairing logic."""
+
+    def test_retrigger_performance(self):
+        """A retrigger closes the first note at the second note_on."""
+        path = _save_temp_midi(_make_retrigger_midi())
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                perf = load_performance_midi(path)
+        finally:
+            os.unlink(path)
+
+        notes = perf.performedparts[0].notes
+        # event count: two notes instead of one overwritten note
+        self.assertEqual(len(notes), 2)
+        self.assertEqual([n["midi_pitch"] for n in notes], [60, 60])
+        self.assertEqual([n["velocity"] for n in notes], [64, 80])
+        # pitches and seconds (120 bpm, 480 ppq -> 240 ticks = 0.25 s)
+        self.assertAlmostEqual(notes[0]["note_on"], 0.0, places=6)
+        self.assertAlmostEqual(notes[0]["note_off"], 0.25, places=6)
+        self.assertAlmostEqual(notes[1]["note_on"], 0.25, places=6)
+        self.assertAlmostEqual(notes[1]["note_off"], 0.5, places=6)
+        # ticks are retained as well
+        self.assertEqual(
+            [(n["note_on_tick"], n["note_off_tick"]) for n in notes],
+            [(0, 240), (240, 480)],
+        )
+
+    def test_retrigger_score(self):
+        """load_score_midi uses the same pairing: two notes on retrigger."""
+        path = _save_temp_midi(_make_retrigger_midi())
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                scr = load_score_midi(path)
+        finally:
+            os.unlink(path)
+
+        na = scr.note_array()
+        self.assertEqual(len(na), 2)
+        self.assertEqual(list(na["pitch"]), [60, 60])
+        self.assertEqual(
+            [(int(n), int(d)) for n, d in zip(na["onset_div"], na["duration_div"])],
+            [(0, 240), (240, 240)],
+        )
+
+    def test_hanging_note_performance(self):
+        """Notes without a note_off are truncated to the last track event."""
+        path = _save_temp_midi(_make_hanging_note_midi())
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                perf = load_performance_midi(path)
+        finally:
+            os.unlink(path)
+
+        self.assertEqual(len(perf.performedparts), 1)
+        notes = perf.performedparts[0].notes
+        # the whole track must not be empty any more
+        self.assertEqual(len(notes), 2)
+        self.assertEqual([n["midi_pitch"] for n in notes], [64, 64])
+        # both notes end at the last event tick (480 -> 0.5 s at 120 bpm)
+        for n in notes:
+            self.assertAlmostEqual(n["note_off"], 0.5, places=6)
+            self.assertEqual(n["note_off_tick"], 480)
+        self.assertAlmostEqual(notes[0]["note_on"], 0.0, places=6)
+        self.assertAlmostEqual(notes[1]["note_on"], 0.5, places=6)
+
+    def test_hanging_note_score(self):
+        """load_score_midi keeps truncated hanging notes instead of crashing."""
+        path = _save_temp_midi(_make_hanging_note_midi())
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                scr = load_score_midi(path)
+        finally:
+            os.unlink(path)
+        # zero-duration truncated note becomes a grace note but is retained
+        self.assertEqual(len(scr.note_array(include_grace_notes=True)), 2)
+
+    def test_noteless_file_raises_value_error(self):
+        """Files without any notes raise a ValueError, not an IndexError."""
+        path = _save_temp_midi(_make_noteless_midi())
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                with self.assertRaises(ValueError):
+                    load_score_midi(path)
+        finally:
+            os.unlink(path)
+
+    def test_noteless_file_performance(self):
+        """The performance loader returns an empty performance, no crash."""
+        path = _save_temp_midi(_make_noteless_midi())
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                perf = load_performance_midi(path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(len(perf.performedparts), 0)
+
+    def test_tempo_on_second_track_seconds(self):
+        """Tempo events outside the first track still drive second conversion."""
+        path = _save_temp_midi(_make_tempo_on_second_track_midi())
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                perf = load_performance_midi(path)
+        finally:
+            os.unlink(path)
+
+        notes = sorted(perf.performedparts[0].notes, key=lambda n: n["midi_pitch"])
+        by_pitch = {n["midi_pitch"]: n for n in notes}
+        # first beat at 120 bpm = 0.5 s, second beat at 60 bpm = 1.0 s
+        self.assertAlmostEqual(by_pitch[60]["note_on"], 0.0, places=6)
+        self.assertAlmostEqual(by_pitch[60]["note_off"], 0.5, places=6)
+        self.assertAlmostEqual(by_pitch[62]["note_on"], 0.5, places=6)
+        self.assertAlmostEqual(by_pitch[62]["note_off"], 1.5, places=6)
+
+    def test_tempo_on_second_track_score_tempos(self):
+        """Score tempo objects are ordered along the global tick timeline."""
+        path = _save_temp_midi(_make_tempo_on_second_track_midi())
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                scr = load_score_midi(path)
+        finally:
+            os.unlink(path)
+
+        part = scr.parts[0]
+        tempos = [(tp.start.t, tp.bpm) for tp in part.iter_all(score.Tempo)]
+        self.assertEqual(tempos, [(0, 120.0), (PPQ, 60.0)])
+
+
+class TestMIDIGlobalTempoTimeline(unittest.TestCase):
+    def test_tempo_changes_spread_across_tracks(self):
+        """Tempo events spread over several tracks apply on one timeline."""
+        mid = mido.MidiFile(ticks_per_beat=PPQ)
+        note_track, tempo_track_1, tempo_track_2 = (
+            mido.MidiTrack(),
+            mido.MidiTrack(),
+            mido.MidiTrack(),
+        )
+        mid.tracks.extend([note_track, tempo_track_1, tempo_track_2])
+        # one note spanning three beats
+        note_track.append(mido.Message("note_on", note=60, velocity=64, time=0))
+        note_track.append(mido.Message("note_off", note=60, velocity=0, time=3 * PPQ))
+        # 120 bpm -> 60 bpm at beat 1 -> 30 bpm at beat 2
+        tempo_track_1.append(
+            mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(120), time=0)
+        )
+        tempo_track_1.append(
+            mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(60), time=PPQ)
+        )
+        tempo_track_2.append(
+            mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(30), time=2 * PPQ)
+        )
+        path = _save_temp_midi(mid)
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                perf = load_performance_midi(path)
+        finally:
+            os.unlink(path)
+
+        note = perf.performedparts[0].notes[0]
+        # 0.5 s + 1.0 s + 2.0 s = 3.5 s
+        self.assertAlmostEqual(note["note_on"], 0.0, places=6)
+        self.assertAlmostEqual(note["note_off"], 3.5, places=6)
+
+    def test_default_bpm_without_tempo_events(self):
+        mid = mido.MidiFile(ticks_per_beat=PPQ)
+        track = mido.MidiTrack()
+        mid.tracks.append(track)
+        track.append(mido.Message("note_on", note=60, velocity=64, time=0))
+        track.append(mido.Message("note_off", note=60, velocity=0, time=PPQ))
+        path = _save_temp_midi(mid)
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                perf = load_performance_midi(path, default_bpm=60)
+        finally:
+            os.unlink(path)
+        # one beat at 60 bpm = 1.0 s
+        self.assertAlmostEqual(
+            perf.performedparts[0].notes[0]["note_off"], 1.0, places=6
+        )

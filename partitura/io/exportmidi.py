@@ -119,7 +119,12 @@ def save_performance_midi(
         to.
     mpq : int, optional
         Microseconds per quarter note. This is known in MIDI parlance
-        as the "tempo" value. Defaults to 500000 (i.e. 120 BPM).
+        as the "tempo" value. Defaults to 500000 (i.e. 120 BPM). If the
+        :class:`~partitura.performance.PerformedPart` instances carry a
+        ``tempo_changes`` attribute (as produced by
+        :func:`~partitura.io.importmidi.load_performance_midi`), the
+        full tempo map is written to the first track and this argument
+        is only used as fallback when no tempo map is available.
     ppq : int, optional
         Parts per quarter, also known as ticks per beat. Defaults to
         480.
@@ -153,6 +158,17 @@ def save_performance_midi(
             "`performance_data` should be a `Performance`, a `PerformedPart`,"
             f" or a list of  `PerformedPart` instances but is {type(performance_data)}"
         )
+
+    # Recover the tempo map of the original performance, if available.
+    # load_performance_midi stores (tick, mpq) pairs on each PerformedPart;
+    # the first part's map is the global MIDI tempo map.
+    tempo_map = None
+    for performed_part in performed_parts:
+        tempo_map = getattr(performed_part, "tempo_changes", None)
+        if tempo_map:
+            break
+    if tempo_map is None:
+        tempo_map = [(0, mpq)]
 
     track_events = defaultdict(lambda: defaultdict(list))
     for performed_part in performed_parts:
@@ -209,8 +225,17 @@ def save_performance_midi(
         for n in performed_part.notes:
             track = n.get("track", 0)
             ch = n.get("channel", 0)
-            t_on = int(np.round(10**6 * ppq * n["note_on"] / mpq))
-            t_off = int(np.round(10**6 * ppq * n["note_off"] / mpq))
+            # Prefer ticks stored on the note (e.g. by
+            # load_performance_midi) when the export ppq matches the
+            # original one: this keeps note times lossless across a
+            # load/save round-trip even with tempo changes. Otherwise
+            # fall back to converting the times in seconds.
+            if "note_on_tick" in n and performed_part.ppq == ppq:
+                t_on = int(round(n["note_on_tick"]))
+                t_off = int(round(n["note_off_tick"]))
+            else:
+                t_on = int(np.round(10**6 * ppq * n["note_on"] / mpq))
+                t_off = int(np.round(10**6 * ppq * n["note_off"] / mpq))
             vel = n.get("velocity", default_velocity)
             track_events[track][t_on].append(
                 Message("note_on", note=n["midi_pitch"], velocity=vel, channel=ch)
@@ -258,6 +283,13 @@ def save_performance_midi(
                         Message("program_change", program=0, channel=ch)
                     )
 
+    # tempo events have a global effect in MIDI, so they are written only
+    # to the first track (as required by the SMF specification)
+    for t_tempo, tempo_mpq in sorted(tempo_map, key=lambda x: x[0]):
+        track_events[0][int(t_tempo)].append(
+            MetaMessage("set_tempo", tempo=int(tempo_mpq))
+        )
+
     midi_type = 0 if len(track_events) == 1 else 1
 
     mf = MidiFile(type=midi_type, ticks_per_beat=ppq)
@@ -265,12 +297,16 @@ def save_performance_midi(
     for j, i in enumerate(sorted(track_events.keys())):
         track = MidiTrack()
         mf.tracks.append(track)
-        if j == 0:
-            track.append(MetaMessage("set_tempo", tempo=mpq, time=0))
         t = 0
+        # sort the events at each time point so that the tempo messages
+        # come first, matching the behavior of freshly created MIDI files
         for t_msg in sorted(track_events[i].keys()):
             t_delta = t_msg - t
-            for msg in track_events[i][t_msg]:
+            messages = sorted(
+                track_events[i][t_msg],
+                key=lambda m: 0 if m.type == "set_tempo" else 1,
+            )
+            for msg in messages:
                 track.append(msg.copy(time=t_delta))
                 t_delta = 0
             t = t_msg
