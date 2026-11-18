@@ -362,13 +362,8 @@ class TestChordSymbolRoundTrip(unittest.TestCase):
         self.assertEqual(chords[0].alter, -1)
         self.assertEqual(chords[0].kind, "m")
 
-    @unittest.skip("Bass import not yet implemented in importmusicxml._handle_harmony")
     def test_roundtrip_chord_with_bass(self):
-        """Test chord with bass note survives round-trip.
-
-        NOTE: Currently skipped because bass import is not implemented.
-        Export handles bass correctly, but import ignores <bass> element.
-        """
+        """Test chord with bass note survives round-trip."""
         part = self._make_part_with_chord("C", "maj", bass="G")
         reimported = self._roundtrip(part)
         chords = list(reimported[0].iter_all(ChordSymbol))

@@ -104,11 +104,21 @@ def make_note_el(note, dur, voice, counter, n_of_staves):
 
     if isinstance(note, score.Note):
         if isinstance(note, score.GraceNote):
+            grace_attrib = {}
             if note.grace_type == "acciaccatura":
-                etree.SubElement(note_e, "grace", slash="yes")
+                grace_attrib["slash"] = "yes"
 
-            else:
-                etree.SubElement(note_e, "grace")
+            if note.steal_proportion is not None:
+                if note.grace_type == "appoggiatura":
+                    grace_attrib["steal-time-following"] = "{:g}".format(
+                        note.steal_proportion * 100
+                    )
+                elif note.grace_type == "acciaccatura":
+                    grace_attrib["steal-time-previous"] = "{:g}".format(
+                        note.steal_proportion * 100
+                    )
+
+            etree.SubElement(note_e, "grace", **grace_attrib)
 
         pitch_e = etree.SubElement(note_e, "pitch")
 
@@ -270,7 +280,7 @@ def make_note_el(note, dur, voice, counter, n_of_staves):
             tuplet_actual_notes_e.text = str(tuplet.actual_notes)
             tuplet_actual_type_e = etree.SubElement(tuplet_actual_e, "tuplet-type")
             tuplet_actual_type_e.text = str(tuplet.actual_type)
-            for _ in range(tuplet.actual_dots):
+            for _ in range(tuplet.actual_dots or 0):
                 etree.SubElement(tuplet_actual_e, "tuplet-dot")
             # tuplet-normal tag
             tuplet_normal_e = etree.SubElement(tuplet_e, "tuplet-normal")
@@ -278,7 +288,7 @@ def make_note_el(note, dur, voice, counter, n_of_staves):
             tuplet_normal_notes_e.text = str(tuplet.normal_notes)
             tuplet_normal_type_e = etree.SubElement(tuplet_normal_e, "tuplet-type")
             tuplet_normal_type_e.text = str(tuplet.normal_type)
-            for _ in range(tuplet.normal_dots):
+            for _ in range(tuplet.normal_dots or 0):
                 etree.SubElement(tuplet_normal_e, "tuplet-dot")
         notations.append(tuplet_e)
 
@@ -895,7 +905,7 @@ def do_harmony(part, start, end):
     harmony = part.iter_all(score.RomanNumeral, start, end)
     result = []
     for h in harmony:
-        harmony_e = etree.Element("harmony", print_frame="no")
+        harmony_e = etree.Element("harmony", **{"print-frame": "no"})
         function = etree.SubElement(harmony_e, "function")
         function.text = h.text
         kind_e = etree.SubElement(harmony_e, "kind", text="")
@@ -903,19 +913,19 @@ def do_harmony(part, start, end):
         result.append((h.start.t, None, harmony_e))
     harmony = part.iter_all(score.ChordSymbol, start, end)
     for h in harmony:
-        harmony_e = etree.Element("harmony", print_frame="no")
-        kind_e = (
-            etree.SubElement(harmony_e, "kind", text=h.kind)
-            if h.kind is not None
-            else etree.SubElement(harmony_e, "kind", text="")
-        )
-        kind_e.text = "none"
+        harmony_e = etree.Element("harmony", **{"print-frame": "no"})
         root_e = etree.SubElement(harmony_e, "root")
         root_step_e = etree.SubElement(root_e, "root-step")
         root_step_e.text = h.root
         if h.alter != 0:
             root_alter_e = etree.SubElement(root_e, "root-alter")
             root_alter_e.text = str(h.alter)
+        kind_e = (
+            etree.SubElement(harmony_e, "kind", text=h.kind)
+            if h.kind is not None
+            else etree.SubElement(harmony_e, "kind", text="")
+        )
+        kind_e.text = "none"
         if h.bass is not None:
             bass_e = etree.SubElement(harmony_e, "bass")
             bass_step_e = etree.SubElement(bass_e, "bass-step")
@@ -926,7 +936,7 @@ def do_harmony(part, start, end):
     # TODO: Merge with existing Roman Numeral and ChordSymbol annotations if they exist.
     harmony = part.iter_all(score.Cadence, start, end)
     for h in harmony:
-        harmony_e = etree.Element("harmony", print_frame="no")
+        harmony_e = etree.Element("harmony", **{"print-frame": "no"})
         function = etree.SubElement(harmony_e, "function")
         function.text = "|" + h.text
         kind_e = etree.SubElement(harmony_e, "kind", text="")
@@ -1000,7 +1010,7 @@ def do_attributes(part, start, end):
             elif isinstance(o, score.Clef):
                 if not staves_included:
                     staves_e = etree.SubElement(attr_e, "staves")
-                    staves_e.text = "{}".format(len(clefs))
+                    staves_e.text = "{}".format(part.number_of_staves)
                     staves_included = True
 
                 clef_e = etree.SubElement(attr_e, "clef")
@@ -1057,21 +1067,56 @@ def save_musicxml(
 
     root = etree.Element("score-partwise")
 
-    # add work metadata
-    if score_data.work_title or score_data.work_number:
+    # add work metadata; the order of the elements follows the MusicXML
+    # content model:
+    # (work?, movement-number?, movement-title?, identification?, defaults?,
+    #  credit*, part-list, part+)
+    if score_data.work_number or score_data.work_title:
         work_tag = etree.SubElement(root, "work")
-        if score_data.work_title:
-            work_title_tag = etree.SubElement(work_tag, "work_title")
-            work_title_tag.text = str(score_data.work_title)
         if score_data.work_number:
-            work_number_tag = etree.SubElement(work_tag, "work_number")
+            work_number_tag = etree.SubElement(work_tag, "work-number")
             work_number_tag.text = str(score_data.work_number)
-    if score_data.movement_title:
-        movement_title_tag = etree.SubElement(root, "movement_title")
-        movement_title_tag.text = str(score_data.movement_title)
+        if score_data.work_title:
+            work_title_tag = etree.SubElement(work_tag, "work-title")
+            work_title_tag.text = str(score_data.work_title)
     if score_data.movement_number:
-        movement_number_tag = etree.SubElement(root, "movement_number")
+        movement_number_tag = etree.SubElement(root, "movement-number")
         movement_number_tag.text = str(score_data.movement_number)
+    if score_data.movement_title:
+        movement_title_tag = etree.SubElement(root, "movement-title")
+        movement_title_tag.text = str(score_data.movement_title)
+
+    # add identification metadata (composer, lyricist, rights)
+    if score_data.composer or score_data.lyricist or score_data.copyright:
+        identification_tag = etree.SubElement(root, "identification")
+        if score_data.composer:
+            composer_tag = etree.SubElement(
+                identification_tag, "creator", type="composer"
+            )
+            composer_tag.text = str(score_data.composer)
+        if score_data.lyricist:
+            lyricist_tag = etree.SubElement(
+                identification_tag, "creator", type="lyricist"
+            )
+            lyricist_tag.text = str(score_data.lyricist)
+        if score_data.copyright:
+            rights_tag = etree.SubElement(identification_tag, "rights")
+            rights_tag.text = str(score_data.copyright)
+
+    # add credit metadata
+    for credit_type, credit_text in (
+        ("title", score_data.title),
+        ("subtitle", score_data.subtitle),
+        ("composer", score_data.composer),
+        ("lyricist", score_data.lyricist),
+        ("rights", score_data.copyright),
+    ):
+        if credit_text:
+            credit_tag = etree.SubElement(root, "credit")
+            credit_type_tag = etree.SubElement(credit_tag, "credit-type")
+            credit_type_tag.text = credit_type
+            credit_words_tag = etree.SubElement(credit_tag, "credit-words")
+            credit_words_tag.text = str(credit_text)
 
     partlist_e = etree.SubElement(root, "part-list")
     state = {

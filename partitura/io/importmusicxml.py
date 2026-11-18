@@ -250,9 +250,21 @@ def load_musicxml(
                 with zipfile.ZipFile(filename) as zipped_xml:
                     with zipped_xml.open("META-INF/container.xml") as container:
                         container_tree = etree.parse(container)
-                        contained_xml_name = container_tree.find(".//rootfile").get(
-                            "full-path"
-                        )
+                        # find the rootfile element regardless of the XML
+                        # namespace used in container.xml (some producers
+                        # declare the ODF container namespace)
+                        rootfile_el = None
+                        for el in container_tree.getroot().iter():
+                            if etree.QName(el).localname == "rootfile":
+                                rootfile_el = el
+                                break
+                        if rootfile_el is None:
+                            raise Exception(
+                                "No rootfile element found in "
+                                "META-INF/container.xml of compressed "
+                                "MusicXML file"
+                            )
+                        contained_xml_name = rootfile_el.get("full-path")
                     xml = zipped_xml.open(contained_xml_name)
 
         if xml is None:
@@ -765,7 +777,14 @@ def _handle_harmony(e, position, part):
         # This breaks bacwkard compatibility, so should be saved for major version update
         root = e.find("root").findtext("root-step")
         root_alter = int(e.find("root").findtext("root-alter") or 0)
-        part.add(score.ChordSymbol(root=root, alter=root_alter, kind=kind), position)
+        bass_el = e.find("bass")
+        bass = None
+        if bass_el is not None:
+            bass = bass_el.findtext("bass-step")
+        part.add(
+            score.ChordSymbol(root=root, alter=root_alter, kind=kind, bass=bass),
+            position,
+        )
         text = None
     else:
         text = None
